@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Webhook handling for Stripe Payout Failures"
+
+Parameters:
+  receipientEmail:
+    Type: "String"
+    Description: "The email address that should be notified about failed payouts."
+
+  senderEmail:
+    Type: "String"
+    Description: "The address emails should be sent from. This needs to be verified in SES."
+
+  lambdaFunctionName:
+    Type: "String"
+    AllowedPattern: "^[a-zA-Z0-9]+[a-zA-Z0-9-]+[a-zA-Z0-9]+$"
+    Default: "FailedPayouts"
+    Description: "Name of the Lambda function"
+
+Resources:
+  apiGateway:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: "stripe-failed-payout-webhook"
+      Description: "Stripe Failed Payout Webhook"
+
+  apiGatewayRootMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "POST"
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "lambdaFunction.Arn"
+      ResourceId: !GetAtt "apiGateway.RootResourceId"
+      RestApiId: !Ref "apiGateway"
+
+  apiGatewayDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DependsOn:
+      - "apiGatewayRootMethod"
+    Properties:
+      RestApiId: !Ref "apiGateway"
+      StageName: "call"
+
+  lambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          var aws = require('aws-sdk');
+          var ses = new aws.SES({region: 'us-east-1'});
+
+          exports.handler = (event, context, callback) => {
+              var body = JSON.parse(event.body);
+
+              if (!body.livemode) {
+                  console.log('Not a live event, not sending email');
+
+                  return;
+              }
+
+              if (body.type != 'payout.failed') {
+                  console.error('Got a different webhook, please set the stripe webhook to only send payout.failed');
+              }
+
+               var params = {
+                  Destination: { ToAddresses: ["${receipientEmail}"] },
+                  Message: {
+                      Body: {
+                          Text: { Data: "There was an error when paying out money from a Stripe account."
+                          + "\nAccount: https://dashboard.stripe.com/connect/accounts/" + body.account
+                          + "\nPayout: https://dashboard.stripe.com/" + body.account + "/payouts/" + body.data.object.id
+                          + "\n\nFull data: " + JSON.stringify(body, null, 2)
+                          }
+                      },
+                      Subject: { Data: "Stripe: Payout Failed" }
+                  },
+                  Source: "${senderEmail}"
+              };
+
+
+               ses.sendEmail(params, function (err, data) {
+                  if (err) {
+                      console.log(err);
+                      context.fail(err);
+                      callback(null, {"statusCode": 500, "body": err});
+                  } else {
+                      console.log(data);
+                      callback(null, {"statusCode": 200, "body": ''});
+                  }
+              });
+          };
+      Description: "Failed Payouts send email"
+      FunctionName: !Ref "lambdaFunctionName"
+      Handler: "index.handler"
+      MemorySize: 128
+      Role: !GetAtt "lambdaIAMRole.Arn"
+      Runtime: "nodejs12.x"
+      Timeout: 10
+
+  lambdaApiGatewayInvoke:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt "lambdaFunction.Arn"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/*/POST/"
+
+  lambdaIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Effect: "Allow"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${lambdaFunctionName}:*"
+          PolicyName: "lambda"
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "ses:SendEmail"
+                  - "ses:SendRawEmail"
+                Effect: "Allow"
+                Resource: "*"
+          PolicyName: "AllowSendingEmails"
+  lambdaLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${lambdaFunctionName}"
+      RetentionInDays: 90
+
+Outputs:
+  apiGatewayInvokeURL:
+    Value: !Sub "https://${apiGateway}.execute-api.${AWS::Region}.amazonaws.com/call"
+
+  lambdaArn:
+    Value: !GetAtt "lambdaFunction.Arn"
